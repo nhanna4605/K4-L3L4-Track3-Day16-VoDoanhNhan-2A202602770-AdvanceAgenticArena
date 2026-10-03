@@ -78,17 +78,56 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _source(self, ctx, text):
+        """doc_id của tài liệu đã đọc nguyên vẹn mà `text` nằm trong một dòng."""
+        corpus = ctx.corpus
+        if corpus is None:
+            return None
+        for doc in corpus.docs:
+            if doc.body in ctx.observed_text and any(
+                text in line for line in doc.body.splitlines()
+            ):
+                return doc.doc_id
+        return None
+
+    def _split(self, ctx, claim):
+        """Tách câu ghép tại " và ": hai nửa đều có trong quan sát, khác tài liệu."""
+        text = claim["text"]
+        pos = text.find(" và ")
+        while pos != -1:
+            left, right = text[:pos].strip(), text[pos + 4:].strip()
+            if left and right and left in ctx.observed_text and right in ctx.observed_text:
+                src_l, src_r = self._source(ctx, left), self._source(ctx, right)
+                if src_l and src_r and src_l != src_r:
+                    return [
+                        {**claim, "text": left, "doc_id": src_l},
+                        {**claim, "text": right, "doc_id": src_r},
+                    ]
+            pos = text.find(" và ", pos + 1)
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        kept, spliced = [], False
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text:
+                continue
+            if text in ctx.observed_text:
+                kept.append(claim)
+                continue
+            halves = self._split(ctx, claim)
+            if halves:
+                kept.extend(halves)
+                spliced = True
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        ctx.state["critic_dropped"] = len(claims) - len(kept)
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ trong tài liệu đã đọc để trả lời câu hỏi này."
+        elif spliced:
+            report["abstain"] = True
+        return report
